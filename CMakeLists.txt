@@ -64,3 +64,9 @@ add_executable(controller_worker_integration_tests tests/controller_worker_integ
 target_link_libraries(controller_worker_integration_tests PRIVATE mini_cloud_protocol)
 add_test(NAME controller_worker_integration_tests COMMAND controller_worker_integration_tests
   $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker>)
+
+add_executable(replicated_placement_integration_tests tests/replicated_placement_integration_test.cpp)
+add_test(NAME replicated_placement_integration_tests COMMAND replicated_placement_integration_tests
+  $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker>)
+set_tests_properties(controller_worker_integration_tests replicated_placement_integration_tests
+  PROPERTIES TIMEOUT 60)

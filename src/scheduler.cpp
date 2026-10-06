@@ -1,5 +1,4 @@
 #include "mini_cloud/scheduler.hpp"
-
 #include <utility>
 
 namespace mini_cloud {

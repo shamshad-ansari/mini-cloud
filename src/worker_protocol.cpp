@@ -84,12 +84,12 @@ std::optional<WorkerMessage> parse_worker_message(const std::string_view line) {
     return std::nullopt;
   }
   if (*type == "heartbeat") return WorkerMessage{WorkerMessageType::heartbeat, std::string(*worker_id), 0, 0, {}, {}};
-  if (*type == "launch_accepted" || *type == "replica_running") {
+  if (*type == "launch_accepted" || *type == "replica_running" || *type == "replica_stopped") {
     const auto workload_id = string_field(line, "workload_id");
     const auto replica_id = string_field(line, "replica_id");
     if (!workload_id || !replica_id) return std::nullopt;
     return WorkerMessage{*type == "launch_accepted" ? WorkerMessageType::launch_accepted
-                                                       : WorkerMessageType::replica_running,
+                                                       : (*type == "replica_running" ? WorkerMessageType::replica_running : WorkerMessageType::replica_stopped),
                          std::string(*worker_id), 0, 0, std::string(*workload_id), std::string(*replica_id)};
   }
   if (*type != "register") return std::nullopt;
@@ -104,9 +104,13 @@ std::optional<ControllerMessage> parse_controller_message(const std::string_view
   if (line.empty() || line.front() != '{' || line.back() != '}') return std::nullopt;
   const auto version = unsigned_field(line, "version");
   const auto type = string_field(line, "type");
-  if (!version || *version != kProtocolVersion || !type || *type != "launch") return std::nullopt;
+  if (!version || *version != kProtocolVersion || !type || (*type != "launch" && *type != "stop")) return std::nullopt;
   const auto workload_id = string_field(line, "workload_id");
   const auto replica_id = string_field(line, "replica_id");
+  if (*type == "stop") {
+    if (!workload_id || !replica_id || !is_valid_worker_id(*workload_id) || !is_valid_worker_id(*replica_id)) return std::nullopt;
+    return ControllerMessage{ControllerMessageType::stop, std::string(*workload_id), std::string(*replica_id), {}, {}, 0, 0};
+  }
   const auto executable = string_field(line, "executable");
   const auto arguments = string_array_field(line, "arguments");
   const auto cpu = unsigned_field(line, "cpu_millicores");
@@ -153,6 +157,16 @@ std::string replica_running_message(const std::string_view worker_id, const std:
   return "{\"version\":1,\"type\":\"replica_running\",\"worker_id\":\"" + json_string(worker_id) +
          "\",\"workload_id\":\"" + json_string(workload_id) + "\",\"replica_id\":\"" + json_string(replica_id) +
          "\",\"pid\":" + std::to_string(pid) + "}";
+}
+
+std::string stop_message(std::string_view workload_id, std::string_view replica_id) {
+  return "{\"version\":1,\"type\":\"stop\",\"workload_id\":\"" + json_string(workload_id) +
+         "\",\"replica_id\":\"" + json_string(replica_id) + "\"}";
+}
+
+std::string replica_stopped_message(std::string_view worker_id, std::string_view workload_id, std::string_view replica_id) {
+  return "{\"version\":1,\"type\":\"replica_stopped\",\"worker_id\":\"" + json_string(worker_id) +
+         "\",\"workload_id\":\"" + json_string(workload_id) + "\",\"replica_id\":\"" + json_string(replica_id) + "\"}";
 }
 
 std::uint64_t timestamp_milliseconds() {

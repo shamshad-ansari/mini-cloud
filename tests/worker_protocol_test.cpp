@@ -53,5 +53,13 @@ int main() {
              "{\"version\":1,\"type\":\"register\",\"worker_id\":\"worker-1\",\"cpu_millicores\":0,\"memory_mib\":4096}"),
          "zero capacity is rejected");
   expect(!mini_cloud::parse_worker_message("not json"), "malformed line is rejected");
+  const auto stop = mini_cloud::parse_controller_message(mini_cloud::stop_message("workload-1", "replica-1"));
+  expect(stop && stop->type == mini_cloud::ControllerMessageType::stop && stop->replica_id == "replica-1",
+         "stop command round trips");
+  const auto stopped = mini_cloud::parse_worker_message(mini_cloud::replica_stopped_message("worker-1", "workload-1", "replica-1"));
+  expect(stopped && stopped->type == mini_cloud::WorkerMessageType::replica_stopped,
+         "stop acknowledgement round trips");
+  expect(!mini_cloud::parse_controller_message("{\"version\":1,\"type\":\"stop\",\"workload_id\":\"workload-1\"}"),
+         "stop without replica ID is rejected");
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

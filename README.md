@@ -111,3 +111,42 @@ well as `reserved_cpu` and `reserved_memory` for the registered worker.
 If capacity cannot satisfy a request, the replica remains pending and the
 `replica_pending` event reports `cpu_deficit_millicores` and
 `memory_deficit_mib`; no process launch is sent to the worker.
+
+## Replicated placement and explicit stop
+
+The controller accepts multiple workers with distinct IDs and explicit capacities.
+For example, start these workers in separate terminals (omit heartbeat count to
+keep each worker connected):
+
+```bash
+./build/mini_cloud_worker 127.0.0.1 7000 worker-a 1000 128 100
+./build/mini_cloud_worker 127.0.0.1 7000 worker-b 1000 128 100
+./build/mini_cloud_worker 127.0.0.1 7000 worker-c 1000 128 100
+```
+
+After all three workers register, enter controller commands:
+
+```text
+submit least-loaded-dominant-resource 500 64 7 -- /bin/sleep 60
+status
+stop workload-1
+status
+stop workload-1
+```
+
+Six replicas run on workers `a, b, c, a, b, c`; replica seven remains pending
+with a deficit of 500 millicores and 64 MiB on each worker. First-fit places the
+same request on `a, a, b, b, c, c`. The controller orders candidates by worker ID,
+so placement with identical available workers and workloads is independent of
+registration order. Reconciliation reserves each placement before selecting the
+next replica and retries pending replicas when workers register or capacity is
+released.
+
+`status` lists each worker's health and reservations, workload desired state, and
+every replica's worker and state (`PENDING`, `LAUNCHING`, `RUNNING`, `STOPPING`,
+`STOPPED`). `stop <workload-id>` sets desired replicas to zero before sending
+remote stop commands. Workers terminate and reap their supervised processes,
+then acknowledge termination; only then does the controller release reservations.
+Pending replicas stop immediately. Repeating a completed stop is harmless, and
+stopped workloads are excluded from reconciliation. Unknown workload IDs report
+an error. Failure recovery after worker disconnection is a separate issue.

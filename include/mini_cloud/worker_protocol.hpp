@@ -10,9 +10,9 @@ namespace mini_cloud {
 
 inline constexpr std::uint64_t kProtocolVersion = 1;
 
-enum class WorkerMessageType { registration, heartbeat, launch_accepted, replica_running };
+enum class WorkerMessageType { registration, heartbeat, launch_accepted, replica_running, replica_stopped };
 
-enum class ControllerMessageType { launch };
+enum class ControllerMessageType { launch, stop };
 
 struct WorkerMessage {
   WorkerMessageType type;
@@ -47,6 +47,8 @@ struct ControllerMessage {
                                                   std::string_view replica_id);
 [[nodiscard]] std::string replica_running_message(std::string_view worker_id, std::string_view workload_id,
                                                    std::string_view replica_id, std::uint64_t pid);
+[[nodiscard]] std::string stop_message(std::string_view workload_id, std::string_view replica_id);
+[[nodiscard]] std::string replica_stopped_message(std::string_view worker_id, std::string_view workload_id, std::string_view replica_id);
 [[nodiscard]] std::uint64_t timestamp_milliseconds();
 [[nodiscard]] std::string lifecycle_event(std::string_view event, std::string_view worker_id);
 

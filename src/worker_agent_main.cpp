@@ -118,6 +118,19 @@ int main(const int argc, char* argv[]) {
         input_buffer.erase(0, newline + 1);
         const auto command = mini_cloud::parse_controller_message(line);
         if (!command) { connected = false; break; }
+        if (command->type == mini_cloud::ControllerMessageType::stop) {
+          bool stopped = true;
+          for (auto it = supervisors.begin(); it != supervisors.end(); ++it) {
+            if ((*it)->replica_id() == command->replica_id) {
+              static_cast<void>((*it)->stop());
+              stopped = (*it)->pid() <= 0;
+              if (stopped) supervisors.erase(it);
+              break;
+            }
+          }
+          if (stopped && !send_line(socket_fd, mini_cloud::replica_stopped_message(worker_id, command->workload_id, command->replica_id))) connected = false;
+          continue;
+        }
         auto supervisor = std::make_unique<mini_cloud::ProcessSupervisor>(command->replica_id);
         if (!supervisor->launch(command->executable, command->arguments)) { connected = false; break; }
         if (!send_line(socket_fd, mini_cloud::launch_accepted_message(worker_id, command->workload_id, command->replica_id)) ||
