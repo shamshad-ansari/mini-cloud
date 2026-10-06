@@ -28,9 +28,11 @@ struct WorkerRecord {
 };
 struct Replica {
   std::string id, worker_id;
-  enum class State { pending, launching, running, stopping, stopped, lost } state = State::pending;
+  enum class State { pending, launching, running, stopping, stopped, lost, exited, failed } state = State::pending;
   bool pending_reported = false;
   std::uint64_t attempt = 0;
+  std::string cgroup_status = "NOT_APPLIED";
+  std::string cgroup_path;
 };
 struct Workload {
   std::string id;
@@ -103,8 +105,10 @@ int main(int argc, char* argv[]) {
     for (auto& w : workloads) for (auto& r : w.replicas) {
       r.pending_reported = false;
       if (r.worker_id != worker.id || r.state == Replica::State::stopped ||
-          r.state == Replica::State::pending || r.state == Replica::State::lost) continue;
+          r.state == Replica::State::pending || r.state == Replica::State::lost ||
+          r.state == Replica::State::exited || r.state == Replica::State::failed) continue;
       r.state = Replica::State::lost;
+      r.cgroup_status = "UNKNOWN";
       ++r.attempt;
       event("replica_lost", fields(w, r) + ",\"worker_id\":\"" + worker.id +
             "\",\"attempt\":" + std::to_string(r.attempt) + ",\"replacement_desired\":" + (w.desired ? "true" : "false"));
@@ -137,6 +141,7 @@ int main(int argc, char* argv[]) {
         worker.resources.reserved = *mini_cloud::checked_add(worker.resources.reserved, w.request);
         r.worker_id = worker.id;
         r.state = Replica::State::launching;
+        r.cgroup_status = "NOT_APPLIED"; r.cgroup_path.clear();
         event("scheduling_decision", fields(w, r) + ",\"policy\":\"" + std::string(mini_cloud::scheduling_policy_name(w.policy)) + "\",\"worker_id\":\"" + worker.id + "\"");
         const auto replacement_fields = fields(w, r) + ",\"worker_id\":\"" + worker.id + "\",\"attempt\":" + std::to_string(r.attempt);
         if (r.attempt > 0) event("replacement_scheduled", replacement_fields);
@@ -189,16 +194,37 @@ int main(int argc, char* argv[]) {
         } else {
           for (auto& w : workloads) if (w.id == message->workload_id) for (auto& r : w.replicas) {
             if (r.id != message->replica_id || r.worker_id != worker.id) continue;
-            if (message->type == mini_cloud::WorkerMessageType::replica_stopped) {
-              if (r.state != Replica::State::stopping) continue;
-              r.state = Replica::State::stopped;
+            if (message->type == mini_cloud::WorkerMessageType::replica_stopped ||
+                message->type == mini_cloud::WorkerMessageType::replica_exited ||
+                message->type == mini_cloud::WorkerMessageType::launch_failed) {
+              // Only a live reservation can be released; repeated terminal reports
+              // must never subtract it twice or affect another replica.
+              if (r.state != Replica::State::launching && r.state != Replica::State::running && r.state != Replica::State::stopping) continue;
+              if (message->type == mini_cloud::WorkerMessageType::replica_stopped && r.state != Replica::State::stopping) continue;
+              if (message->type == mini_cloud::WorkerMessageType::launch_failed && r.state == Replica::State::running) continue;
+              r.state = !w.desired ? Replica::State::stopped :
+                  message->type == mini_cloud::WorkerMessageType::launch_failed ? Replica::State::failed : Replica::State::exited;
+              r.cgroup_status = message->type == mini_cloud::WorkerMessageType::launch_failed ? "NOT_APPLIED" : "RELEASED";
               worker.resources.reserved.cpu_millicores -= w.request.cpu_millicores;
               worker.resources.reserved.memory_mib -= w.request.memory_mib;
-              event("replica_stopped", fields(w, r) + ",\"worker_id\":\"" + worker.id + "\"");
+              const auto name = message->type == mini_cloud::WorkerMessageType::replica_stopped ? "replica_stopped" :
+                  message->type == mini_cloud::WorkerMessageType::replica_exited ? "replica_exited" : "replica_launch_failed";
+              std::string terminal_fields = fields(w, r) + ",\"worker_id\":\"" + worker.id + "\",\"reservation_released\":true";
+              if (message->type != mini_cloud::WorkerMessageType::launch_failed) terminal_fields += ",\"cleanup_complete\":true";
+              if (message->type == mini_cloud::WorkerMessageType::replica_exited)
+                terminal_fields += ",\"exit_code\":" + std::to_string(message->exit_code) + ",\"signal\":" + std::to_string(message->signal);
+              if (message->type == mini_cloud::WorkerMessageType::launch_failed)
+                terminal_fields += ",\"reason\":\"" + message->reason + "\"";
+              event(name, terminal_fields);
               for (auto& pending_w : workloads) for (auto& pending_r : pending_w.replicas) pending_r.pending_reported = false;
             } else if (w.desired && (r.state == Replica::State::launching || r.state == Replica::State::running)) {
               const bool first_running = message->type == mini_cloud::WorkerMessageType::replica_running && r.state == Replica::State::launching;
-              if (message->type == mini_cloud::WorkerMessageType::replica_running) r.state = Replica::State::running;
+              if (message->type == mini_cloud::WorkerMessageType::replica_running) {
+                r.state = Replica::State::running;
+                r.cgroup_status = message->cgroup_enforced ? "ENFORCED" : "DISABLED";
+                r.cgroup_path = message->cgroup_path;
+                event("replica_enforcement", fields(w, r) + ",\"worker_id\":\"" + worker.id + "\",\"cgroup_enforced\":" + (message->cgroup_enforced ? "true" : "false"));
+              }
               event(message->type == mini_cloud::WorkerMessageType::launch_accepted ? "launch_accepted" : "replica_running", fields(w, r) + ",\"worker_id\":\"" + worker.id + "\"");
               if (r.attempt > 0) {
                 const auto replacement_fields = fields(w, r) + ",\"worker_id\":\"" + worker.id + "\",\"attempt\":" + std::to_string(r.attempt);
@@ -226,21 +252,22 @@ int main(int argc, char* argv[]) {
       else if (command == "status") {
         std::cout << "RECOVERY heartbeat_timeout_ms=" << *timeout_ms
                   << " partition_safe=false exactly_once=false duplicate_execution_possible=true\n";
-        std::size_t desired = 0, pending = 0, running = 0;
+        std::size_t desired = 0, pending = 0, running = 0, exited = 0, failed = 0;
         for (const auto& w : workloads) for (const auto& r : w.replicas) {
           desired += w.desired; pending += w.desired && (r.state == Replica::State::pending || r.state == Replica::State::lost); running += r.state == Replica::State::running;
+          exited += r.state == Replica::State::exited; failed += r.state == Replica::State::failed;
         }
         bool registered = false;
         for (const auto& worker : workers) if (!worker.id.empty()) {
           registered = true;
-          std::cout << "STATUS worker=" << worker.id << " health=" << (worker.dead ? "DEAD" : healthy(worker, *timeout_ms) ? "HEALTHY" : "UNHEALTHY") << " cpu=" << worker.resources.capacity.cpu_millicores << "m memory=" << worker.resources.capacity.memory_mib << "MiB reserved_cpu=" << worker.resources.reserved.cpu_millicores << "m reserved_memory=" << worker.resources.reserved.memory_mib << "MiB desired=" << desired << " pending=" << pending << " running=" << running << '\n';
+          std::cout << "STATUS worker=" << worker.id << " health=" << (worker.dead ? "DEAD" : healthy(worker, *timeout_ms) ? "HEALTHY" : "UNHEALTHY") << " cpu=" << worker.resources.capacity.cpu_millicores << "m memory=" << worker.resources.capacity.memory_mib << "MiB reserved_cpu=" << worker.resources.reserved.cpu_millicores << "m reserved_memory=" << worker.resources.reserved.memory_mib << "MiB desired=" << desired << " pending=" << pending << " running=" << running << " exited=" << exited << " failed=" << failed << '\n';
         }
-        if (!registered) std::cout << "STATUS worker=none health=UNHEALTHY desired=" << desired << " pending=" << pending << " running=" << running << '\n';
+        if (!registered) std::cout << "STATUS worker=none health=UNHEALTHY desired=" << desired << " pending=" << pending << " running=" << running << " exited=" << exited << " failed=" << failed << '\n';
         for (const auto& w : workloads) {
           std::cout << "WORKLOAD id=" << w.id << " desired=" << (w.desired ? w.replicas.size() : 0) << " state=" << (w.desired ? "ACTIVE" : std::all_of(w.replicas.begin(), w.replicas.end(), [](const auto& r) { return r.state == Replica::State::stopped; }) ? "STOPPED" : "STOPPING") << '\n';
           for (const auto& r : w.replicas) {
-            const char* names[] = {"PENDING", "LAUNCHING", "RUNNING", "STOPPING", "STOPPED", "LOST"};
-            std::cout << "REPLICA id=" << r.id << " worker=" << (r.worker_id.empty() ? "none" : r.worker_id) << " state=" << names[static_cast<int>(r.state)] << '\n';
+            const char* names[] = {"PENDING", "LAUNCHING", "RUNNING", "STOPPING", "STOPPED", "LOST", "EXITED", "FAILED"};
+            std::cout << "REPLICA id=" << r.id << " worker=" << (r.worker_id.empty() ? "none" : r.worker_id) << " state=" << names[static_cast<int>(r.state)] << " cgroup=" << r.cgroup_status << " cgroup_path=" << (r.cgroup_path.empty() ? "none" : r.cgroup_path) << '\n';
           }
         }
         std::cout.flush();
@@ -253,7 +280,7 @@ int main(int argc, char* argv[]) {
           auto& w = *it;
           w.desired = false;
           for (auto& r : w.replicas) {
-            if (r.state == Replica::State::pending) r.state = Replica::State::stopped;
+            if (r.state == Replica::State::pending || r.state == Replica::State::exited || r.state == Replica::State::failed) r.state = Replica::State::stopped;
             else if (r.state != Replica::State::stopped && r.state != Replica::State::lost) {
               r.state = Replica::State::stopping;
               for (const auto& worker : workers) if (worker.id == r.worker_id && worker.fd >= 0) static_cast<void>(send_line(worker.fd, mini_cloud::stop_message(w.id, r.id)));

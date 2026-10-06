@@ -60,15 +60,22 @@ bool send_line(const int socket_fd, const std::string& line) {
   return true;
 }
 
+void log_replica_message(std::string message) {
+  const auto type = message.find("\"type\"");
+  if (type != std::string::npos) message.replace(type, 6, "\"event\"");
+  message.insert(1, "\"timestamp_ms\":" + std::to_string(mini_cloud::timestamp_milliseconds()) + ",");
+  std::cout << message << std::endl;
+}
+
 void usage(const char* program) {
   std::cerr << "Usage: " << program
-            << " <host> <port> <worker-id> <cpu-millicores> <memory-mib> <heartbeat-ms> [heartbeat-count]\n";
+            << " <host> <port> <worker-id> <cpu-millicores> <memory-mib> <heartbeat-ms> [heartbeat-count] [--cgroup-root <delegated-parent> | --no-cgroups]\n";
 }
 
 }  // namespace
 
 int main(const int argc, char* argv[]) {
-  if (argc != 7 && argc != 8) {
+  if (argc < 7) {
     usage(argv[0]);
     return 2;
   }
@@ -76,7 +83,18 @@ int main(const int argc, char* argv[]) {
   const auto cpu_millicores = parse_unsigned(argv[4]);
   const auto memory_mib = parse_unsigned(argv[5]);
   const auto heartbeat_milliseconds = parse_unsigned(argv[6]);
-  const auto heartbeat_count = argc == 8 ? parse_unsigned(argv[7]) : std::optional<std::uint64_t>{0};
+  int option = 7;
+  std::optional<std::uint64_t> heartbeat_count{0};
+  if (option < argc && std::string_view(argv[option]).starts_with("--") == false) heartbeat_count = parse_unsigned(argv[option++]);
+  bool enforce_cgroups = true;
+  std::filesystem::path cgroup_root = "/sys/fs/cgroup";
+  if (option < argc) {
+    const std::string_view flag = argv[option++];
+    if (flag == "--no-cgroups") enforce_cgroups = false;
+    else if (flag == "--cgroup-root" && option < argc) cgroup_root = argv[option++];
+    else { usage(argv[0]); return 2; }
+  }
+  if (option != argc) { usage(argv[0]); return 2; }
   if (!port || *port == 0 || *port > 65535 || !mini_cloud::is_valid_worker_id(argv[3]) ||
       !cpu_millicores || *cpu_millicores == 0 || !memory_mib || *memory_mib == 0 ||
       !heartbeat_milliseconds || *heartbeat_milliseconds == 0 || !heartbeat_count) {
@@ -84,6 +102,14 @@ int main(const int argc, char* argv[]) {
     return 2;
   }
   std::signal(SIGPIPE, SIG_IGN);
+  const std::string scope_prefix = "mini-cloud-" + std::string(argv[3]) + "-" + std::to_string(getpid()) + "-";
+  if (enforce_cgroups) {
+    mini_cloud::CgroupScope probe(cgroup_root, scope_prefix + "probe");
+    if (!probe.configure(1, 1) || !probe.cleanup()) {
+      std::cerr << "CGROUP_ERROR: " << probe.error() << '\n';
+      return 1;
+    }
+  }
   const int socket_fd = connect_to_host(argv[1], argv[2]);
   if (socket_fd < 0) {
     std::cerr << "Unable to connect to controller.\n";
@@ -97,7 +123,15 @@ int main(const int argc, char* argv[]) {
   }
   std::cout << mini_cloud::lifecycle_event("worker_registration_sent", worker_id) << std::endl;
 
-  std::vector<std::unique_ptr<mini_cloud::ProcessSupervisor>> supervisors;
+  std::cout << "{\"timestamp_ms\":" << mini_cloud::timestamp_milliseconds()
+            << ",\"event\":\"worker_enforcement\",\"worker_id\":\"" << worker_id
+            << "\",\"cgroup_enforcement\":\"" << (enforce_cgroups ? "REQUIRED" : "DISABLED") << "\"}" << std::endl;
+  struct ManagedReplica {
+    std::string workload_id;
+    std::unique_ptr<mini_cloud::ProcessSupervisor> supervisor;
+    bool intentional_stop = false;
+  };
+  std::vector<ManagedReplica> supervisors;
   std::string input_buffer;
   std::uint64_t sent = 0;
   auto next_heartbeat = std::chrono::steady_clock::now();
@@ -121,28 +155,49 @@ int main(const int argc, char* argv[]) {
         const auto command = mini_cloud::parse_controller_message(line);
         if (!command) { connected = false; break; }
         if (command->type == mini_cloud::ControllerMessageType::stop) {
-          bool stopped = true;
-          for (auto it = supervisors.begin(); it != supervisors.end(); ++it) {
-            if ((*it)->replica_id() == command->replica_id) {
-              static_cast<void>((*it)->stop());
-              stopped = (*it)->pid() <= 0;
-              if (stopped) supervisors.erase(it);
+          bool known = false;
+          for (auto& managed : supervisors) {
+            if (managed.supervisor && managed.workload_id == command->workload_id && managed.supervisor->replica_id() == command->replica_id) {
+              managed.intentional_stop = true;
+              const auto stopped = managed.supervisor->stop();
+              // Terminal acknowledgements are emitted below only after cleanup.
+              if (stopped && stopped->cleanup_complete) {
+                if (!send_line(socket_fd, mini_cloud::replica_stopped_message(worker_id, command->workload_id, command->replica_id))) connected = false;
+                managed.supervisor.reset();
+              }
+              known = true;
               break;
             }
           }
-          if (stopped && !send_line(socket_fd, mini_cloud::replica_stopped_message(worker_id, command->workload_id, command->replica_id))) connected = false;
+          if (!known && !send_line(socket_fd, mini_cloud::replica_stopped_message(worker_id, command->workload_id, command->replica_id))) connected = false;
           continue;
         }
         auto supervisor = std::make_unique<mini_cloud::ProcessSupervisor>(command->replica_id);
-        if (!supervisor->launch(command->executable, command->arguments)) { connected = false; break; }
+        std::unique_ptr<mini_cloud::CgroupScope> scope;
+        if (enforce_cgroups) {
+          scope = std::make_unique<mini_cloud::CgroupScope>(cgroup_root, scope_prefix + command->replica_id);
+          if (!scope->configure(command->cpu_millicores, command->memory_mib)) {
+            std::cerr << "CGROUP_ERROR replica=" << command->replica_id << ": " << scope->error() << '\n';
+            if (!send_line(socket_fd, mini_cloud::replica_launch_failed_message(worker_id, command->workload_id, command->replica_id, "cgroup_setup_failed"))) connected = false;
+            continue;
+          }
+        }
+        const auto scope_path = scope ? scope->path().string() : std::string{};
+        if (!supervisor->launch(command->executable, command->arguments, std::move(scope))) {
+          std::cerr << "LAUNCH_ERROR replica=" << command->replica_id << ": " << supervisor->error() << '\n';
+          if (!send_line(socket_fd, mini_cloud::replica_launch_failed_message(worker_id, command->workload_id, command->replica_id, "runtime_launch_failed"))) connected = false;
+          continue;
+        }
         if (!send_line(socket_fd, mini_cloud::launch_accepted_message(worker_id, command->workload_id, command->replica_id)) ||
             !send_line(socket_fd, mini_cloud::replica_running_message(worker_id, command->workload_id, command->replica_id,
-                                                                      static_cast<std::uint64_t>(supervisor->pid())))) {
+                                                                      static_cast<std::uint64_t>(supervisor->pid()), enforce_cgroups, scope_path))) {
           connected = false;
           break;
         }
-        std::cout << mini_cloud::lifecycle_event("replica_running", worker_id) << std::endl;
-        supervisors.push_back(std::move(supervisor));
+        // Reuse protocol serialization so paths and arguments are escaped correctly.
+        log_replica_message(mini_cloud::replica_running_message(worker_id, command->workload_id, command->replica_id,
+                          static_cast<std::uint64_t>(supervisor->pid()), enforce_cgroups, scope_path));
+        supervisors.push_back({command->workload_id, std::move(supervisor), false});
       }
     }
     if (std::chrono::steady_clock::now() >= next_heartbeat) {
@@ -151,7 +206,23 @@ int main(const int argc, char* argv[]) {
       std::cout << mini_cloud::lifecycle_event("worker_heartbeat_sent", worker_id) << std::endl;
       next_heartbeat = std::chrono::steady_clock::now() + std::chrono::milliseconds(*heartbeat_milliseconds);
     }
-    for (auto& supervisor : supervisors) static_cast<void>(supervisor->poll());
+    for (auto it = supervisors.begin(); it != supervisors.end();) {
+      if (!it->supervisor) { it = supervisors.erase(it); continue; }
+      const auto termination = it->intentional_stop ? it->supervisor->stop() : it->supervisor->poll();
+      if (!termination) { ++it; continue; }
+      if (!termination->cleanup_complete) {
+        std::cerr << "CGROUP_CLEANUP_ERROR replica=" << it->supervisor->replica_id() << ": " << it->supervisor->error() << '\n';
+        ++it; continue;
+      }
+      const auto message = it->intentional_stop
+          ? mini_cloud::replica_stopped_message(worker_id, it->workload_id, it->supervisor->replica_id())
+          : mini_cloud::replica_exited_message(worker_id, it->workload_id, it->supervisor->replica_id(),
+                termination->exited_normally ? static_cast<std::uint64_t>(termination->exit_code) : 0,
+                termination->terminated_by_signal ? static_cast<std::uint64_t>(termination->signal_number) : 0);
+      if (!send_line(socket_fd, message)) connected = false;
+      log_replica_message(message);
+      it = supervisors.erase(it);
+    }
   }
   close(socket_fd);
   return 0;

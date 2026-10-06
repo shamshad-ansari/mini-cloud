@@ -119,7 +119,7 @@ int main(const int argc, char* argv[]) {
 
   const pid_t worker = fork();
   if (worker == 0) {
-    execl(argv[2], argv[2], "127.0.0.1", port_text.c_str(), "agent-1", "2000", "4096", "30", "20", nullptr);
+    execl(argv[2], argv[2], "127.0.0.1", port_text.c_str(), "agent-1", "2000", "4096", "30", "20", "--no-cgroups", nullptr);
     _exit(127);
   }
   expect(worker > 0, "worker process starts");

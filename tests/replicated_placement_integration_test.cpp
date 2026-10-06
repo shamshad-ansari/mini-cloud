@@ -126,7 +126,7 @@ void scenario(const char* controller_app, const char* worker_app, const std::str
     if (worker == 0) {
       close(input[1]); close(output[0]);
       const auto quiet = open("/dev/null", O_WRONLY); dup2(quiet, STDOUT_FILENO); close(quiet);
-      execl(worker_app, worker_app, "127.0.0.1", port_text.c_str(), id.c_str(), "1000", "128", "100", nullptr); _exit(127);
+      execl(worker_app, worker_app, "127.0.0.1", port_text.c_str(), id.c_str(), "1000", "128", "100", "--no-cgroups", nullptr); _exit(127);
     }
     workers.push_back(worker);
     wait_for("\"event\":\"worker_registered\",\"worker_id\":\"" + id + "\"");

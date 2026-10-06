@@ -20,7 +20,7 @@ endif()
 add_executable(resource_admission_tracer src/main.cpp)
 target_link_libraries(resource_admission_tracer PRIVATE mini_cloud_resources)
 
-add_library(mini_cloud_runtime src/process_supervisor.cpp)
+add_library(mini_cloud_runtime src/process_supervisor.cpp src/cgroup.cpp)
 target_include_directories(mini_cloud_runtime PUBLIC include)
 target_compile_features(mini_cloud_runtime PUBLIC cxx_std_23)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -75,3 +75,19 @@ add_executable(worker_recovery_integration_tests tests/worker_recovery_integrati
 add_test(NAME worker_recovery_integration_tests COMMAND worker_recovery_integration_tests
   $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker>)
 set_tests_properties(worker_recovery_integration_tests PROPERTIES TIMEOUT 40)
+
+add_executable(cgroup_tests tests/cgroup_test.cpp)
+target_link_libraries(cgroup_tests PRIVATE mini_cloud_runtime)
+add_test(NAME cgroup_tests COMMAND cgroup_tests $<TARGET_FILE:runtime_fixture>)
+
+add_executable(cgroup_integration_tests tests/cgroup_integration_test.cpp)
+target_link_libraries(cgroup_integration_tests PRIVATE mini_cloud_runtime)
+add_test(NAME cgroup_integration_tests COMMAND cgroup_integration_tests $<TARGET_FILE:runtime_fixture>)
+add_executable(runtime_accounting_integration_tests tests/runtime_accounting_integration_test.cpp)
+add_test(NAME runtime_accounting_integration_tests COMMAND runtime_accounting_integration_tests
+  $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker> $<TARGET_FILE:runtime_fixture>)
+add_test(NAME cgroup_worker_integration_tests COMMAND runtime_accounting_integration_tests
+  $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker> $<TARGET_FILE:runtime_fixture> --enforced)
+set_tests_properties(cgroup_integration_tests cgroup_worker_integration_tests
+  PROPERTIES LABELS privileged SKIP_RETURN_CODE 77 TIMEOUT 60)
+set_tests_properties(runtime_accounting_integration_tests PROPERTIES TIMEOUT 60)

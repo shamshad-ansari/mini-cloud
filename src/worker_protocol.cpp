@@ -8,14 +8,33 @@
 namespace mini_cloud {
 namespace {
 
-std::optional<std::string_view> string_field(const std::string_view line, const std::string_view name) {
+std::optional<std::string> quoted_string(std::string_view line, std::size_t& cursor) {
+  if (cursor >= line.size() || line[cursor++] != '"') return std::nullopt;
+  std::string value;
+  while (cursor < line.size()) {
+    char character = line[cursor++];
+    if (character == '"') return value;
+    if (character == '\\') {
+      if (cursor >= line.size()) return std::nullopt;
+      character = line[cursor++];
+      switch (character) {
+        case 'n': character = '\n'; break;
+        case 'r': character = '\r'; break;
+        case 't': character = '\t'; break;
+        case '"': case '\\': case '/': break;
+        default: return std::nullopt;
+      }
+    } else if (static_cast<unsigned char>(character) < 32) return std::nullopt;
+    value += character;
+  }
+  return std::nullopt;
+}
+std::optional<std::string> string_field(const std::string_view line, const std::string_view name) {
   const std::string marker = "\"" + std::string(name) + "\":\"";
   const auto start = line.find(marker);
   if (start == std::string_view::npos) return std::nullopt;
-  const auto value_start = start + marker.size();
-  const auto value_end = line.find('"', value_start);
-  if (value_end == std::string_view::npos) return std::nullopt;
-  return line.substr(value_start, value_end - value_start);
+  auto cursor = start + marker.size() - 1;
+  return quoted_string(line, cursor);
 }
 
 std::optional<std::uint64_t> unsigned_field(const std::string_view line, const std::string_view name) {
@@ -40,10 +59,9 @@ std::optional<std::vector<std::string>> string_array_field(const std::string_vie
   std::vector<std::string> values;
   if (cursor < line.size() && line[cursor] == ']') return values;
   while (cursor < line.size() && line[cursor] == '"') {
-    const auto end = line.find('"', cursor + 1);
-    if (end == std::string_view::npos) return std::nullopt;
-    values.emplace_back(line.substr(cursor + 1, end - cursor - 1));
-    cursor = end + 1;
+    const auto value = quoted_string(line, cursor);
+    if (!value) return std::nullopt;
+    values.push_back(*value);
     if (cursor < line.size() && line[cursor] == ']') return values;
     if (cursor >= line.size() || line[cursor] != ',') return std::nullopt;
     ++cursor;
@@ -55,6 +73,9 @@ std::string json_string(const std::string_view value) {
   std::string result;
   result.reserve(value.size());
   for (const char character : value) {
+    if (character == '\n') { result += "\\n"; continue; }
+    if (character == '\r') { result += "\\r"; continue; }
+    if (character == '\t') { result += "\\t"; continue; }
     if (character == '"' || character == '\\') result.push_back('\\');
     result.push_back(character);
   }
@@ -83,21 +104,41 @@ std::optional<WorkerMessage> parse_worker_message(const std::string_view line) {
   if (!version || *version != kProtocolVersion || !type || !worker_id || !is_valid_worker_id(*worker_id)) {
     return std::nullopt;
   }
-  if (*type == "heartbeat") return WorkerMessage{WorkerMessageType::heartbeat, std::string(*worker_id), 0, 0, {}, {}};
-  if (*type == "launch_accepted" || *type == "replica_running" || *type == "replica_stopped") {
+  if (*type == "heartbeat") return WorkerMessage{WorkerMessageType::heartbeat, std::string(*worker_id), 0, 0, {}, {}, false, {}, {}, 0, 0};
+  if (*type == "launch_accepted" || *type == "replica_running" || *type == "replica_stopped" ||
+      *type == "replica_exited" || *type == "launch_failed") {
     const auto workload_id = string_field(line, "workload_id");
     const auto replica_id = string_field(line, "replica_id");
-    if (!workload_id || !replica_id) return std::nullopt;
-    return WorkerMessage{*type == "launch_accepted" ? WorkerMessageType::launch_accepted
-                                                       : (*type == "replica_running" ? WorkerMessageType::replica_running : WorkerMessageType::replica_stopped),
-                         std::string(*worker_id), 0, 0, std::string(*workload_id), std::string(*replica_id)};
+    if (!workload_id || !replica_id || !is_valid_worker_id(*workload_id) || !is_valid_worker_id(*replica_id)) return std::nullopt;
+    WorkerMessageType kind = WorkerMessageType::launch_accepted;
+    if (*type == "replica_running") kind = WorkerMessageType::replica_running;
+    else if (*type == "replica_stopped") kind = WorkerMessageType::replica_stopped;
+    else if (*type == "replica_exited") kind = WorkerMessageType::replica_exited;
+    else if (*type == "launch_failed") kind = WorkerMessageType::launch_failed;
+    WorkerMessage result{kind, *worker_id, 0, 0, *workload_id, *replica_id, false, {}, {}, 0, 0};
+    if (kind == WorkerMessageType::replica_running) {
+      const auto enforced = unsigned_field(line, "cgroup_enforced");
+      if (enforced && *enforced > 1) return std::nullopt;
+      result.cgroup_enforced = enforced.value_or(0) == 1;
+      result.cgroup_path = string_field(line, "cgroup_path").value_or("");
+      if (result.cgroup_enforced && result.cgroup_path.empty()) return std::nullopt;
+    } else if (kind == WorkerMessageType::replica_exited) {
+      const auto code = unsigned_field(line, "exit_code"); const auto signal = unsigned_field(line, "signal");
+      if (!code || !signal) return std::nullopt;
+      result.exit_code = *code; result.signal = *signal;
+    } else if (kind == WorkerMessageType::launch_failed) {
+      const auto reason = string_field(line, "reason");
+      if (!reason || !is_valid_worker_id(*reason)) return std::nullopt;
+      result.reason = *reason;
+    }
+    return result;
   }
   if (*type != "register") return std::nullopt;
 
   const auto cpu_millicores = unsigned_field(line, "cpu_millicores");
   const auto memory_mib = unsigned_field(line, "memory_mib");
   if (!cpu_millicores || !memory_mib || *cpu_millicores == 0 || *memory_mib == 0) return std::nullopt;
-  return WorkerMessage{WorkerMessageType::registration, std::string(*worker_id), *cpu_millicores, *memory_mib, {}, {}};
+  return WorkerMessage{WorkerMessageType::registration, std::string(*worker_id), *cpu_millicores, *memory_mib, {}, {}, false, {}, {}, 0, 0};
 }
 
 std::optional<ControllerMessage> parse_controller_message(const std::string_view line) {
@@ -153,10 +194,11 @@ std::string launch_accepted_message(const std::string_view worker_id, const std:
 }
 
 std::string replica_running_message(const std::string_view worker_id, const std::string_view workload_id,
-                                    const std::string_view replica_id, const std::uint64_t pid) {
+                                    const std::string_view replica_id, const std::uint64_t pid, bool cgroup_enforced, std::string_view cgroup_path) {
   return "{\"version\":1,\"type\":\"replica_running\",\"worker_id\":\"" + json_string(worker_id) +
          "\",\"workload_id\":\"" + json_string(workload_id) + "\",\"replica_id\":\"" + json_string(replica_id) +
-         "\",\"pid\":" + std::to_string(pid) + "}";
+         "\",\"pid\":" + std::to_string(pid) + ",\"cgroup_enforced\":" + (cgroup_enforced ? "1" : "0") +
+         ",\"cgroup_path\":\"" + json_string(cgroup_path) + "\"}";
 }
 
 std::string stop_message(std::string_view workload_id, std::string_view replica_id) {
@@ -167,6 +209,19 @@ std::string stop_message(std::string_view workload_id, std::string_view replica_
 std::string replica_stopped_message(std::string_view worker_id, std::string_view workload_id, std::string_view replica_id) {
   return "{\"version\":1,\"type\":\"replica_stopped\",\"worker_id\":\"" + json_string(worker_id) +
          "\",\"workload_id\":\"" + json_string(workload_id) + "\",\"replica_id\":\"" + json_string(replica_id) + "\"}";
+}
+
+std::string replica_exited_message(std::string_view worker_id, std::string_view workload_id,
+                                   std::string_view replica_id, std::uint64_t exit_code, std::uint64_t signal) {
+  return "{\"version\":1,\"type\":\"replica_exited\",\"worker_id\":\"" + json_string(worker_id) +
+         "\",\"workload_id\":\"" + json_string(workload_id) + "\",\"replica_id\":\"" + json_string(replica_id) +
+         "\",\"exit_code\":" + std::to_string(exit_code) + ",\"signal\":" + std::to_string(signal) + "}";
+}
+std::string replica_launch_failed_message(std::string_view worker_id, std::string_view workload_id,
+                                          std::string_view replica_id, std::string_view reason) {
+  return "{\"version\":1,\"type\":\"launch_failed\",\"worker_id\":\"" + json_string(worker_id) +
+         "\",\"workload_id\":\"" + json_string(workload_id) + "\",\"replica_id\":\"" + json_string(replica_id) +
+         "\",\"reason\":\"" + json_string(reason) + "\"}";
 }
 
 std::uint64_t timestamp_milliseconds() {

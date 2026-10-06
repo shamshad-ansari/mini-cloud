@@ -128,7 +128,7 @@ class Cluster {
       close(input_); close(output_);
       const int quiet = open("/dev/null", O_WRONLY); dup2(quiet, STDOUT_FILENO); close(quiet);
       execl(worker_app_, worker_app_, "127.0.0.1", port_.c_str(), id.c_str(),
-            full ? "500" : "1000", full ? "64" : "128", "30", nullptr); _exit(127);
+            full ? "500" : "1000", full ? "64" : "128", "30", "--no-cgroups", nullptr); _exit(127);
     }
     if (pid <= 0) throw std::runtime_error("worker fork failed");
     setpgid(pid, pid); workers_.push_back(pid);

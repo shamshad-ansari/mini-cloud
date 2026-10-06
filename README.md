@@ -70,11 +70,13 @@ and `quit` to stop it.
 ./build/mini_cloud_controller 7000
 ```
 
-Start a worker in another terminal. The final argument sends 20 heartbeats at a
+Start a worker in another terminal. Worker examples assume privileged cgroup
+access on the Ubuntu VM; see the enforcement section below for user delegation.
+The final argument sends 20 heartbeats at a
 50-millisecond interval; omit it or use `0` to continue sending indefinitely.
 
 ```bash
-./build/mini_cloud_worker 127.0.0.1 7000 worker-a 2000 4096 50 20
+sudo ./build/mini_cloud_worker 127.0.0.1 7000 worker-a 2000 4096 50 20
 ```
 
 The controller emits versioned JSON Lines events such as:
@@ -119,9 +121,9 @@ For example, start these workers in separate terminals (omit heartbeat count to
 keep each worker connected):
 
 ```bash
-./build/mini_cloud_worker 127.0.0.1 7000 worker-a 1000 128 100
-./build/mini_cloud_worker 127.0.0.1 7000 worker-b 1000 128 100
-./build/mini_cloud_worker 127.0.0.1 7000 worker-c 1000 128 100
+sudo ./build/mini_cloud_worker 127.0.0.1 7000 worker-a 1000 128 100
+sudo ./build/mini_cloud_worker 127.0.0.1 7000 worker-b 1000 128 100
+sudo ./build/mini_cloud_worker 127.0.0.1 7000 worker-c 1000 128 100
 ```
 
 After all three workers register, enter controller commands:
@@ -213,11 +215,110 @@ This recovery path supports agent crash/kill and TCP loss. It does not provide
 partition safety, fencing, or exactly-once execution. Old processes may keep
 running after an agent is killed or disconnected, so replacements can cause
 duplicate execution. `RUNNING` counts acknowledged controller placements and
-does not prove that old copies have terminated. Recovery of a child process exit
-on an otherwise healthy agent is outside this failure path.
+does not prove that old copies have terminated. Automatic replacement after a child process exit on an otherwise healthy agent
+is outside this failure path; exits are reported and reservations are released.
 
 Run the recovery integration test with:
 
 ```bash
 ctest --test-dir build -R worker_recovery_integration_tests --output-on-failure
 ```
+
+## Enforced CPU and memory limits (Linux cgroup v2)
+
+Workers now require cgroup v2 enforcement by default. The worker needs a writable
+parent with `cpu` and `memory` already enabled in `cgroup.subtree_control`. It
+creates only its own replica scopes and does not change the parent's controller
+configuration. Linux must provide `cgroup.kill` (Linux 5.14 or newer), swap
+controls, and group OOM handling.
+
+On the privileged Ubuntu VM, start the controller as before and run a worker
+with the necessary cgroup permissions:
+
+```bash
+sudo ./build/mini_cloud_worker 127.0.0.1 7000 worker-a 2000 256 100
+# Or choose an already delegated parent:
+./build/mini_cloud_worker 127.0.0.1 7000 worker-a 2000 256 100 \
+  --cgroup-root /sys/fs/cgroup/my-delegated-parent
+```
+
+The worker must run within the same delegation as the replica scopes. For a
+systemd user delegation on this VM, this can be done with a temporary service:
+
+```bash
+cgroup_parent="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
+systemd-run --user --wait --pipe --collect --property=Delegate=yes \
+  "$PWD/build/mini_cloud_worker" 127.0.0.1 7000 worker-a 2000 256 100 \
+  --cgroup-root "$cgroup_parent"
+```
+
+Each replica gets a dedicated `mini-cloud-<worker-id>-<agent-pid>-<replica-id>`
+cgroup. Before the executable is allowed to run, the runtime configures:
+
+| Control | Submitted request |
+| --- | --- |
+| `cpu.max` | `<millicores × 1000> 1000000` (quota/period in microseconds) |
+| `memory.max` | `<MiB × 1048576>` bytes |
+| `memory.swap.max` | `0` |
+| `memory.oom.group` | `1` |
+
+The one-second CPU period preserves even a 1-millicore request without rounding
+up its quota. CPU limits constrain bandwidth over the period; a process may use
+CPU in bursts within that budget. Memory charges are capped by the kernel,
+and swap is disabled. These controls follow the
+[Linux cgroup v2 interface](https://docs.kernel.org/admin-guide/cgroup-v2.html).
+This privileged tracer assumes trusted ordinary-scheduling workloads; it is not
+a security boundary against a workload that changes its own cgroup controls.
+
+For example, submit:
+
+```text
+submit first-fit 250 32 1 -- /bin/sleep 30
+status
+stop workload-1
+```
+
+Worker `replica_running` events include `cgroup_enforced` and `cgroup_path`.
+Controller status shows `cgroup=ENFORCED` and the actual scope path; inspect
+`cpu.max`, `memory.max`, and `cgroup.procs` there while the replica is running.
+The worker refuses startup or launch with an actionable `CGROUP_ERROR` or
+`LAUNCH_ERROR` when delegation, permissions, required interfaces, or attachment
+are unavailable. It never silently switches to an unenforced launch.
+
+Explicit stop terminates the scope, including descendants, and reaps the child.
+Unexpected exit also removes the scope and any remaining descendants. Terminal
+acknowledgements are sent only after cleanup; the controller then releases CPU
+and memory reservations exactly once. Cleanup failures are reported and retried
+without claiming successful termination. Healthy-agent child exits appear as
+`EXITED`; rejected launches appear as `FAILED`. Neither is automatically
+relaunched, so a memory-limit failure cannot cause an endless OOM/restart loop.
+Explicit stop of an already exited/failed replica remains harmless.
+
+For the unprivileged scheduling/recovery tests only, `--no-cgroups` explicitly
+disables enforcement. Worker events and controller status show `DISABLED` in
+this mode. The local process-supervision tracer remains an unbounded lifecycle
+fixture. Do not use these modes to verify resource enforcement.
+
+The normal suite tests configuration, failure rollback, attachment before exec,
+cleanup retries, protocol reporting, and reservation accounting. The two tests
+labelled `privileged` exercise real kernel values, CPU throttling, a bounded
+128-MiB abuse fixture killed by its 32-MiB cgroup, and end-to-end worker cleanup.
+They skip with an explanation if neither root nor a delegated parent is supplied:
+
+```bash
+ctest --test-dir build --output-on-failure
+sudo ctest --test-dir build -L privileged --output-on-failure
+```
+
+Alternatively, run the real enforcement tests within your user delegation:
+
+```bash
+cgroup_parent="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
+systemd-run --user --wait --pipe --collect --property=Delegate=yes \
+  env MINI_CLOUD_CGROUP_ROOT="$cgroup_parent" \
+  ctest --test-dir "$PWD/build" -L privileged --output-on-failure
+```
+
+Tests create and remove their own scopes. An agent killed with `SIGKILL` can
+leave old processes/scopes behind; the worker-failure recovery limitations above
+still apply, and this change does not claim fencing or exactly-once execution.

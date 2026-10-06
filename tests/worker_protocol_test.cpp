@@ -61,5 +61,13 @@ int main() {
          "stop acknowledgement round trips");
   expect(!mini_cloud::parse_controller_message("{\"version\":1,\"type\":\"stop\",\"workload_id\":\"workload-1\"}"),
          "stop without replica ID is rejected");
+  const auto enforced = mini_cloud::parse_worker_message(mini_cloud::replica_running_message("worker-1", "workload-1", "replica-1", 123, true, "/sys/fs/cgroup/test"));
+  expect(enforced && enforced->cgroup_enforced && enforced->cgroup_path == "/sys/fs/cgroup/test", "running acknowledgement identifies applied enforcement");
+  const auto exited = mini_cloud::parse_worker_message(mini_cloud::replica_exited_message("worker-1", "workload-1", "replica-1", 0, 9));
+  expect(exited && exited->type == mini_cloud::WorkerMessageType::replica_exited && exited->signal == 9, "exit report preserves termination signal");
+  const auto failed = mini_cloud::parse_worker_message(mini_cloud::replica_launch_failed_message("worker-1", "workload-1", "replica-1", "cgroup_setup_failed"));
+  expect(failed && failed->type == mini_cloud::WorkerMessageType::launch_failed && failed->reason == "cgroup_setup_failed", "launch failure identifies setup error");
+  const auto escaped = mini_cloud::parse_controller_message(mini_cloud::launch_message("workload-1", "replica-1", "/tmp/path with spaces", {"quoted\"value", "back\\slash"}, 250, 64));
+  expect(escaped && escaped->arguments == std::vector<std::string>{"quoted\"value", "back\\slash"}, "protocol preserves escaped executable arguments");
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
