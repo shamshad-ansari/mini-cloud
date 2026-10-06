@@ -24,11 +24,13 @@ struct WorkerRecord {
   std::string buffer, id;
   mini_cloud::WorkerResources resources{};
   std::chrono::steady_clock::time_point heartbeat;
+  bool dead = false;
 };
 struct Replica {
   std::string id, worker_id;
-  enum class State { pending, launching, running, stopping, stopped } state = State::pending;
+  enum class State { pending, launching, running, stopping, stopped, lost } state = State::pending;
   bool pending_reported = false;
+  std::uint64_t attempt = 0;
 };
 struct Workload {
   std::string id;
@@ -61,17 +63,24 @@ bool send_line(int fd, const std::string& line) {
   while (sent_total < message.size()) { const auto sent = send(fd, message.data() + sent_total, message.size() - sent_total, 0); if (sent <= 0) return false; sent_total += static_cast<std::size_t>(sent); }
   return true;
 }
-bool healthy(const WorkerRecord& worker) {
-  return !worker.id.empty() && worker.fd >= 0 && std::chrono::steady_clock::now() - worker.heartbeat < std::chrono::seconds(2);
+bool healthy(const WorkerRecord& worker, std::uint64_t timeout_ms) {
+  return !worker.dead && !worker.id.empty() && worker.fd >= 0 &&
+         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - worker.heartbeat).count()) < timeout_ms;
 }
 void event(std::string_view name, std::string_view fields = {}) { std::cout << "{\"timestamp_ms\":" << mini_cloud::timestamp_milliseconds() << ",\"event\":\"" << name << "\"" << fields << "}" << std::endl; }
-void usage(const char* app) { std::cerr << "Usage: " << app << " <localhost-port>\nCommands: status, stop <workload-id>, submit <policy> <cpu-millicores> <memory-mib> <replicas> -- <executable> [arguments...], quit\n"; }
+void usage(const char* app) { std::cerr << "Usage: " << app << " <localhost-port> [heartbeat-timeout-ms]\nCommands: status, stop <workload-id>, submit <policy> <cpu-millicores> <memory-mib> <replicas> -- <executable> [arguments...], quit\n"; }
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  if (argc != 2) { usage(argv[0]); return 2; }
+  if (argc != 2 && argc != 3) { usage(argv[0]); return 2; }
   const auto port = number(argv[1]);
   if (!port || *port == 0 || *port > 65535) { std::cerr << "Port must be an integer from 1 through 65535.\n"; return 2; }
+  const auto timeout_ms = argc == 3 ? number(argv[2]) : std::optional<std::uint64_t>{2000};
+  if (!timeout_ms || *timeout_ms == 0) {
+    std::cerr << "Heartbeat timeout must be a positive integer in milliseconds.\n";
+    return 2;
+  }
   std::signal(SIGPIPE, SIG_IGN);
   const int listener = listen_local(static_cast<std::uint16_t>(*port));
   if (listener < 0) { std::cerr << "Unable to listen on localhost.\n"; return 1; }
@@ -83,14 +92,34 @@ int main(int argc, char* argv[]) {
   auto fields = [](const Workload& w, const Replica& r) {
     return ",\"workload_id\":\"" + w.id + "\",\"replica_id\":\"" + r.id + "\"";
   };
+  auto mark_dead = [&](WorkerRecord& worker, std::string_view reason) {
+    if (worker.dead) return;
+    worker.dead = true;
+    if (worker.fd >= 0) close(worker.fd);
+    worker.fd = -1;
+    if (worker.id.empty()) return;
+    event("worker_dead", ",\"worker_id\":\"" + worker.id + "\",\"reason\":\"" + std::string(reason) +
+          "\",\"heartbeat_timeout_ms\":" + std::to_string(*timeout_ms));
+    for (auto& w : workloads) for (auto& r : w.replicas) {
+      r.pending_reported = false;
+      if (r.worker_id != worker.id || r.state == Replica::State::stopped ||
+          r.state == Replica::State::pending || r.state == Replica::State::lost) continue;
+      r.state = Replica::State::lost;
+      ++r.attempt;
+      event("replica_lost", fields(w, r) + ",\"worker_id\":\"" + worker.id +
+            "\",\"attempt\":" + std::to_string(r.attempt) + ",\"replacement_desired\":" + (w.desired ? "true" : "false"));
+    }
+    // Dead capacity is unavailable. Old processes may still execute; this is not fencing.
+    worker.resources.reserved = {0, 0};
+  };
   auto reconcile = [&] {
     // The event loop serializes reservations and launches, one replica at a time.
     for (auto& w : workloads) {
       if (!w.desired) continue;
       for (auto& r : w.replicas) {
-        if (r.state != Replica::State::pending) continue;
+        if (r.state != Replica::State::pending && r.state != Replica::State::lost) continue;
         std::vector<mini_cloud::Worker> candidates;
-        for (const auto& worker : workers) if (healthy(worker)) candidates.push_back({worker.id, worker.resources});
+        for (const auto& worker : workers) if (healthy(worker, *timeout_ms)) candidates.push_back({worker.id, worker.resources});
         std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
         const auto selection = mini_cloud::choose_worker(w.policy, candidates, w.request);
         if (!selection) {
@@ -105,11 +134,17 @@ int main(int argc, char* argv[]) {
           continue;
         }
         auto& worker = *std::find_if(workers.begin(), workers.end(), [&](const auto& worker) { return worker.id == candidates[*selection].id; });
-        if (!send_line(worker.fd, mini_cloud::launch_message(w.id, r.id, w.executable, w.arguments, w.request.cpu_millicores, w.request.memory_mib))) continue;
         worker.resources.reserved = *mini_cloud::checked_add(worker.resources.reserved, w.request);
         r.worker_id = worker.id;
         r.state = Replica::State::launching;
         event("scheduling_decision", fields(w, r) + ",\"policy\":\"" + std::string(mini_cloud::scheduling_policy_name(w.policy)) + "\",\"worker_id\":\"" + worker.id + "\"");
+        const auto replacement_fields = fields(w, r) + ",\"worker_id\":\"" + worker.id + "\",\"attempt\":" + std::to_string(r.attempt);
+        if (r.attempt > 0) event("replacement_scheduled", replacement_fields);
+        if (!send_line(worker.fd, mini_cloud::launch_message(w.id, r.id, w.executable, w.arguments, w.request.cpu_millicores, w.request.memory_mib))) {
+          mark_dead(worker, "launch_send_failure");
+          continue;
+        }
+        if (r.attempt > 0) event("replacement_launch_issued", replacement_fields);
       }
     }
   };
@@ -119,15 +154,19 @@ int main(int argc, char* argv[]) {
     for (const auto& worker : workers) fds.push_back({worker.fd, POLLIN, 0});
     if (stdin_open) fds.push_back({STDIN_FILENO, POLLIN, 0});
     if (poll(fds.data(), fds.size(), command_buffer.find('\n') == std::string::npos ? 100 : 0) < 0) continue;
+    for (auto& worker : workers) {
+      if (!worker.dead && !worker.id.empty() && !healthy(worker, *timeout_ms)) mark_dead(worker, "heartbeat_timeout");
+    }
     if (fds[0].revents & POLLIN) {
       int accepted = accept(listener, nullptr, nullptr);
       if (accepted >= 0) { WorkerRecord worker; worker.fd = accepted; workers.push_back(std::move(worker)); }
     }
     for (std::size_t i = 0; i < worker_count; ++i) {
       auto& worker = workers[i];
+      if (worker.fd < 0) continue;
       if (!(fds[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
       char chunk[2048]; const auto received = recv(worker.fd, chunk, sizeof(chunk), 0);
-      if (received <= 0) { event("worker_disconnected", ",\"worker_id\":\"" + worker.id + "\""); close(worker.fd); worker.fd = -1; continue; }
+      if (received <= 0) { event("worker_disconnected", ",\"worker_id\":\"" + worker.id + "\""); mark_dead(worker, "tcp_loss"); continue; }
       worker.buffer.append(chunk, static_cast<std::size_t>(received));
       while (worker.fd >= 0) {
         const auto newline = worker.buffer.find('\n'); if (newline == std::string::npos) break;
@@ -137,7 +176,7 @@ int main(int argc, char* argv[]) {
         if (valid && message->type == mini_cloud::WorkerMessageType::registration) {
           valid = worker.id.empty() && std::none_of(workers.begin(), workers.end(), [&](const auto& other) { return other.id == message->worker_id; });
         } else if (valid) valid = !worker.id.empty() && worker.id == message->worker_id;
-        if (!valid) { event("protocol_error"); close(worker.fd); worker.fd = -1; break; }
+        if (!valid) { event("protocol_error"); mark_dead(worker, "protocol_error"); break; }
         if (message->type == mini_cloud::WorkerMessageType::registration) {
           worker.id = message->worker_id;
           worker.resources = {{message->cpu_millicores, message->memory_mib}, {0, 0}};
@@ -158,8 +197,14 @@ int main(int argc, char* argv[]) {
               event("replica_stopped", fields(w, r) + ",\"worker_id\":\"" + worker.id + "\"");
               for (auto& pending_w : workloads) for (auto& pending_r : pending_w.replicas) pending_r.pending_reported = false;
             } else if (w.desired && (r.state == Replica::State::launching || r.state == Replica::State::running)) {
+              const bool first_running = message->type == mini_cloud::WorkerMessageType::replica_running && r.state == Replica::State::launching;
               if (message->type == mini_cloud::WorkerMessageType::replica_running) r.state = Replica::State::running;
               event(message->type == mini_cloud::WorkerMessageType::launch_accepted ? "launch_accepted" : "replica_running", fields(w, r) + ",\"worker_id\":\"" + worker.id + "\"");
+              if (r.attempt > 0) {
+                const auto replacement_fields = fields(w, r) + ",\"worker_id\":\"" + worker.id + "\",\"attempt\":" + std::to_string(r.attempt);
+                if (message->type == mini_cloud::WorkerMessageType::launch_accepted) event("replacement_launch_accepted", replacement_fields);
+                if (first_running) event("replacement_running", replacement_fields);
+              }
             }
           }
         }
@@ -179,20 +224,22 @@ int main(int argc, char* argv[]) {
       command_buffer.erase(0, command_end + 1);
       if (command == "quit") keep_running = false;
       else if (command == "status") {
+        std::cout << "RECOVERY heartbeat_timeout_ms=" << *timeout_ms
+                  << " partition_safe=false exactly_once=false duplicate_execution_possible=true\n";
         std::size_t desired = 0, pending = 0, running = 0;
         for (const auto& w : workloads) for (const auto& r : w.replicas) {
-          desired += w.desired; pending += w.desired && r.state == Replica::State::pending; running += r.state == Replica::State::running;
+          desired += w.desired; pending += w.desired && (r.state == Replica::State::pending || r.state == Replica::State::lost); running += r.state == Replica::State::running;
         }
         bool registered = false;
         for (const auto& worker : workers) if (!worker.id.empty()) {
           registered = true;
-          std::cout << "STATUS worker=" << worker.id << " health=" << (healthy(worker) ? "HEALTHY" : "UNHEALTHY") << " cpu=" << worker.resources.capacity.cpu_millicores << "m memory=" << worker.resources.capacity.memory_mib << "MiB reserved_cpu=" << worker.resources.reserved.cpu_millicores << "m reserved_memory=" << worker.resources.reserved.memory_mib << "MiB desired=" << desired << " pending=" << pending << " running=" << running << '\n';
+          std::cout << "STATUS worker=" << worker.id << " health=" << (worker.dead ? "DEAD" : healthy(worker, *timeout_ms) ? "HEALTHY" : "UNHEALTHY") << " cpu=" << worker.resources.capacity.cpu_millicores << "m memory=" << worker.resources.capacity.memory_mib << "MiB reserved_cpu=" << worker.resources.reserved.cpu_millicores << "m reserved_memory=" << worker.resources.reserved.memory_mib << "MiB desired=" << desired << " pending=" << pending << " running=" << running << '\n';
         }
         if (!registered) std::cout << "STATUS worker=none health=UNHEALTHY desired=" << desired << " pending=" << pending << " running=" << running << '\n';
         for (const auto& w : workloads) {
           std::cout << "WORKLOAD id=" << w.id << " desired=" << (w.desired ? w.replicas.size() : 0) << " state=" << (w.desired ? "ACTIVE" : std::all_of(w.replicas.begin(), w.replicas.end(), [](const auto& r) { return r.state == Replica::State::stopped; }) ? "STOPPED" : "STOPPING") << '\n';
           for (const auto& r : w.replicas) {
-            const char* names[] = {"PENDING", "LAUNCHING", "RUNNING", "STOPPING", "STOPPED"};
+            const char* names[] = {"PENDING", "LAUNCHING", "RUNNING", "STOPPING", "STOPPED", "LOST"};
             std::cout << "REPLICA id=" << r.id << " worker=" << (r.worker_id.empty() ? "none" : r.worker_id) << " state=" << names[static_cast<int>(r.state)] << '\n';
           }
         }
@@ -207,7 +254,7 @@ int main(int argc, char* argv[]) {
           w.desired = false;
           for (auto& r : w.replicas) {
             if (r.state == Replica::State::pending) r.state = Replica::State::stopped;
-            else if (r.state != Replica::State::stopped) {
+            else if (r.state != Replica::State::stopped && r.state != Replica::State::lost) {
               r.state = Replica::State::stopping;
               for (const auto& worker : workers) if (worker.id == r.worker_id && worker.fd >= 0) static_cast<void>(send_line(worker.fd, mini_cloud::stop_message(w.id, r.id)));
             }

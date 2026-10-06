@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <netdb.h>
+#include <fcntl.h>
 #include <optional>
 #include <memory>
 #include <string>
@@ -39,7 +40,8 @@ int connect_to_host(const std::string& host, const std::string& port) {
   int socket_fd = -1;
   for (auto* address = addresses; address; address = address->ai_next) {
     socket_fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-    if (socket_fd >= 0 && connect(socket_fd, address->ai_addr, address->ai_addrlen) == 0) break;
+    // Replica processes must not keep the agent's control connection alive after a crash.
+    if (socket_fd >= 0 && fcntl(socket_fd, F_SETFD, FD_CLOEXEC) == 0 && connect(socket_fd, address->ai_addr, address->ai_addrlen) == 0) break;
     if (socket_fd >= 0) close(socket_fd);
     socket_fd = -1;
   }

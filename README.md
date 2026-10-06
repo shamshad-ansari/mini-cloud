@@ -149,4 +149,75 @@ remote stop commands. Workers terminate and reap their supervised processes,
 then acknowledge termination; only then does the controller release reservations.
 Pending replicas stop immediately. Repeating a completed stop is harmless, and
 stopped workloads are excluded from reconciliation. Unknown workload IDs report
-an error. Failure recovery after worker disconnection is a separate issue.
+an error.
+
+## Worker failure detection and replica recovery
+
+The controller uses a fixed heartbeat timeout of 2000 milliseconds by default.
+An optional second argument sets a positive timeout in milliseconds for the
+controller session:
+
+```bash
+./build/mini_cloud_controller 7000 2000
+```
+
+Use the three workers above and submit a workload with spare recovery capacity:
+
+```text
+submit least-loaded-dominant-resource 500 64 3 -- /bin/sleep 60
+status
+```
+
+The initial placements are `worker-a`, `worker-b`, `worker-c`. Kill the agent
+process for `worker-a` (for example, `kill -KILL <agent-pid>`). TCP loss marks it
+`DEAD` immediately; when the connection remains open but heartbeats cease, the
+controller marks it dead after the timeout. Timeout checks run at least once per
+100-millisecond polling cycle under normal load. Each worker transitions to dead
+once, and its capacity is excluded from scheduling. Dead IDs remain reserved for
+the controller session; a restarted worker must register with a new ID.
+
+The lost replica is replaced on `worker-b` using the same workload and replica
+IDs. Reconciliation reserves capacity one replica at a time using the workload's
+original policy. Replacement is confirmed only by the new worker's running
+acknowledgement. JSONL events distinguish these stages in order:
+
+```text
+worker_dead
+replica_lost
+replacement_scheduled
+replacement_launch_issued
+replacement_launch_accepted
+replacement_running
+```
+
+Each event includes `timestamp_ms` and worker identity. Replica events also
+include workload and replica IDs; loss and replacement events include an
+`attempt` number that increases on each loss. Worker death includes the reason
+and configured timeout. The original scheduling and launch events remain
+available as well.
+
+Without healthy spare capacity, the replica stays `LOST`, reports per-worker
+capacity deficits, and contributes to the `pending` count. Other running
+replicas keep their placement. Registering additional capacity allows recovery;
+explicitly stopped workloads are excluded, including when stopped while lost.
+If termination on a lost worker cannot be confirmed, its replica remains `LOST`
+and the stopped workload reports `STOPPING` with desired count zero.
+
+`status` reports dead workers and includes:
+
+```text
+RECOVERY heartbeat_timeout_ms=2000 partition_safe=false exactly_once=false duplicate_execution_possible=true
+```
+
+This recovery path supports agent crash/kill and TCP loss. It does not provide
+partition safety, fencing, or exactly-once execution. Old processes may keep
+running after an agent is killed or disconnected, so replacements can cause
+duplicate execution. `RUNNING` counts acknowledged controller placements and
+does not prove that old copies have terminated. Recovery of a child process exit
+on an otherwise healthy agent is outside this failure path.
+
+Run the recovery integration test with:
+
+```bash
+ctest --test-dir build -R worker_recovery_integration_tests --output-on-failure
+```

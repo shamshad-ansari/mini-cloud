@@ -70,3 +70,8 @@ add_test(NAME replicated_placement_integration_tests COMMAND replicated_placemen
   $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker>)
 set_tests_properties(controller_worker_integration_tests replicated_placement_integration_tests
   PROPERTIES TIMEOUT 60)
+
+add_executable(worker_recovery_integration_tests tests/worker_recovery_integration_test.cpp)
+add_test(NAME worker_recovery_integration_tests COMMAND worker_recovery_integration_tests
+  $<TARGET_FILE:mini_cloud_controller> $<TARGET_FILE:mini_cloud_worker>)
+set_tests_properties(worker_recovery_integration_tests PROPERTIES TIMEOUT 40)
