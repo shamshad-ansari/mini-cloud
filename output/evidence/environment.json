@@ -1,0 +1,14 @@
+{
+  "snapshot_date": "2026-10-06",
+  "commit": "50d05f09e261bc4c8598a4bec6de2be584b3a20e",
+  "platform": "Linux-7.0.0-34-generic-aarch64-with-glibc2.43",
+  "compiler": "GNU C++ 15.2.0",
+  "cmake": "4.2.3",
+  "project_build": "Debug",
+  "benchmark_build": "-O2",
+  "executed_suites": 9,
+  "skipped_privileged_suites": 2,
+  "benchmark_rows": 80,
+  "scope": "single-host tests; synthetic scheduler capacities",
+  "assistance": "AI-assisted report preparation and supplemental benchmark"
+}
